@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.tsbuildinfo
+apps/web/vite.config.js
+apps/web/vite.config.d.ts
+.env
+.env.*
+!.env.example
+.data/
+reports/*.json
+!reports/live-store-smoke.json
+!.gitkeep
