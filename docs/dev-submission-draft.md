@@ -30,7 +30,7 @@ The demo shows the private household login, recipe entry, meal planning, Gemma s
 
 <!-- Replace this with the public repository URL before publishing. -->
 
-[View the source code](CODE_REPOSITORY_URL)
+[View the source code](https://github.com/desislavsi/home-meal-planner)
 
 ## How I Built It
 
@@ -46,7 +46,7 @@ Gemma is used for meal suggestions and recipe-aware interpretation. Mastra provi
 
 The app supports two modes:
 
-- Live mode checks public product pages from VMV and Randi. Their current smoke-test evidence is stored in [`reports/live-store-smoke.json`](https://github.com/REPLACE_WITH_REPOSITORY_URL/blob/main/reports/live-store-smoke.json).
+- Live mode checks public product pages from VMV and Randi. Their current smoke-test evidence is stored in [`reports/live-store-smoke.json`](https://github.com/desislavsi/home-meal-planner/blob/main/reports/live-store-smoke.json).
 - Fixture mode provides repeatable offline data for testing and for a demo when a store page is unavailable.
 
 The app never signs in to a store, edits a cart, or checks out. It hands the friend the selected product links so they remain in control of the purchase.
