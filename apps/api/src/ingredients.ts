@@ -36,6 +36,19 @@ const semanticText = (ingredient: Ingredient) => [
 
 export function semanticKey(ingredient: Ingredient): string { return semanticText(ingredient); }
 
+export function recoverIngredientQuantity(ingredient: Ingredient): Ingredient {
+  // Older imports retained the original text but dropped long units such as
+  // tablespoons. Recover missing fields independently; explicit edits win.
+  const fromName = parseIngredientAmount(ingredient.name);
+  const fromRaw = parseIngredientAmount(ingredient.raw ?? '');
+  const quantity = ingredient.quantity ?? fromName.quantity ?? fromRaw.quantity;
+  const unit = ingredient.unit && ingredient.unit !== 'unknown'
+    ? ingredient.unit : fromName.unit ?? fromRaw.unit;
+  const name = fromName.quantity != null
+    ? stripIngredientUnit(stripIngredientAmount(ingredient.name)) : ingredient.name;
+  return { ...ingredient, name: name || ingredient.name, quantity, unit };
+}
+
 export function consolidateIngredients(plan: MealPlan, recipes: Map<string, Recipe>): ShoppingLine[] {
   const grouped = new Map<string, ShoppingLine>();
   for (const entry of plan.entries) {
@@ -43,24 +56,23 @@ export function consolidateIngredients(plan: MealPlan, recipes: Map<string, Reci
     if (!recipe) continue;
     const factor = entry.servings / recipe.servings;
     for (const rawIngredient of recipe.ingredients) {
-      const embeddedAmount = rawIngredient.quantity == null ? parseIngredientAmount(rawIngredient.name) : {};
-      const embeddedName = rawIngredient.quantity == null && embeddedAmount.quantity != null
-        ? stripIngredientUnit(stripIngredientAmount(rawIngredient.name))
-        : rawIngredient.name;
+      const recovered = recoverIngredientQuantity(rawIngredient);
       const ingredient: Ingredient = {
-        ...rawIngredient,
-        name: embeddedName || rawIngredient.name,
-        quantity: (rawIngredient.quantity ?? embeddedAmount.quantity) == null ? undefined : (rawIngredient.quantity ?? embeddedAmount.quantity)! * factor,
-        unit: normalizeUnit(rawIngredient.unit ?? embeddedAmount.unit) as Ingredient['unit'],
+        ...recovered,
+        quantity: recovered.quantity == null ? undefined : recovered.quantity * factor,
+        unit: normalizeUnit(recovered.unit) as Ingredient['unit'],
       };
-      const key = semanticKey(ingredient);
+      const base = baseQuantity(ingredient.quantity ?? 0, ingredient.unit);
+      // An unspecified drizzle is a separate requirement; it must not erase
+      // the quantity already calculated for measured ingredients.
+      const key = `${semanticKey(ingredient)}|${ingredient.quantity == null ? 'unmeasured' : base.unit ?? ingredient.unit ?? 'unknown'}`;
       const existing = grouped.get(key);
       if (!existing) {
         grouped.set(key, {
           id: randomUUID(),
           ingredient,
-          requiredQuantity: ingredient.quantity,
-          requiredUnit: ingredient.unit,
+          requiredQuantity: ingredient.quantity == null ? undefined : base.value,
+          requiredUnit: base.unit ?? ingredient.unit,
           semanticKey: key,
           offers: [],
           included: true,
@@ -75,6 +87,8 @@ export function consolidateIngredients(plan: MealPlan, recipes: Map<string, Reci
       } else if (existing.requiredQuantity == null || ingredient.quantity == null) {
         existing.requiredQuantity = undefined;
         existing.requiredUnit = undefined;
+      } else if (existing.requiredUnit === ingredient.unit) {
+        existing.requiredQuantity += ingredient.quantity;
       }
     }
   }

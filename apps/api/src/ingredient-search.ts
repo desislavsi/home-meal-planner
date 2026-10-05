@@ -71,8 +71,18 @@ const aliasGroups: AliasGroup[] = [
     category: 'pantry',
   },
   {
-    keys: ['olive oil', 'oil', '\u0437\u0435\u0445\u0442\u0438\u043d', '\u043e\u043b\u0438\u043e'],
-    searchTerms: ['\u0437\u0435\u0445\u0442\u0438\u043d', '\u043e\u043b\u0438\u043e', 'olive oil', 'oil'],
+    keys: ['olive oil', 'зехтин', 'маслиново масло'],
+    searchTerms: ['зехтин', 'маслиново масло', 'olive oil'],
+    category: 'pantry',
+  },
+  {
+    keys: ['vinegar', 'оцет'],
+    searchTerms: ['оцет', 'vinegar'],
+    category: 'pantry',
+  },
+  {
+    keys: ['oil', 'олио'],
+    searchTerms: ['олио', 'oil'],
     category: 'pantry',
   },
 ];
@@ -105,7 +115,7 @@ export function canonicalIngredientName(name: string): string {
 }
 
 function matchesKey(canonicalName: string, key: string): boolean {
-  return canonicalName === key || canonicalName.startsWith(`${key} `) || canonicalName.includes(` ${key}`);
+  return ` ${canonicalName} `.includes(` ${key} `);
 }
 
 function findAliasGroup(canonicalName: string): AliasGroup | undefined {
@@ -147,7 +157,7 @@ export function productMatchesIngredient(ingredient: Ingredient, offer: ProductO
   const profile = buildIngredientSearchProfile(ingredient);
   const title = normalizeText(offer.title);
 
-  if (!profile.searchTerms.some((term) => title.includes(term))) {
+  if (!profile.searchTerms.some((term) => matchesKey(title, term))) {
     return false;
   }
 
@@ -155,6 +165,44 @@ export function productMatchesIngredient(ingredient: Ingredient, offer: ProductO
     return false;
   }
 
+  const requested = normalizeText([ingredient.name, ...ingredient.modifiers].join(' '));
+  if (isOliveOilName(profile.canonicalName)) {
+    if (!isStandaloneLiquidProduct(title, 'oil')) return false;
+    if (/extra[ -]virgin|екстра\s+върджин/u.test(requested) && !/extra[ -]virgin|екстра\s+върджин/u.test(title)) return false;
+  }
+  if (/vinegar|оцет/u.test(profile.canonicalName)) {
+    if (!isStandaloneLiquidProduct(title, 'vinegar')) return false;
+    if (/red wine|червен/u.test(requested) && (!/red wine|червен/u.test(title) || !/wine|винен/u.test(title) || /balsamic|балсам/u.test(title))) return false;
+  }
+
+  if (profile.category === 'produce') {
+    const forms = [
+      ['canned', /canned|консерв|белени|пелати|маринован|pickled/u],
+      ['frozen', /frozen|замраз/u],
+      ['dried', /dried|сушен/u],
+    ] as const;
+    const desiredForm = ingredient.form ?? forms.find(([, pattern]) => pattern.test(requested))?.[0] ?? 'fresh';
+    const actualForm = forms.find(([, pattern]) => pattern.test(title))?.[0] ?? 'fresh';
+    if (desiredForm !== actualForm) return false;
+    if (/пържен|чипс|pomsticks|chips|crisps|сос|пюре|кетчуп|супа|сок/u.test(title)) return false;
+    if (/kiwano|кивано/u.test(title) && !/kiwano|кивано/u.test(requested)) return false;
+  }
+
   return true;
+}
+
+export function isOliveOilName(name: string): boolean {
+  return /olive oil|зехтин|маслиново масло/iu.test(name);
+}
+
+export function isStandaloneLiquidProduct(title: string, kind: 'oil' | 'vinegar'): boolean {
+  const normalized = normalizeText(title);
+  const marker = kind === 'oil' ? /зехтин|маслиново масло|olive oil/iu : /оцет|vinegar/iu;
+  const match = marker.exec(normalized);
+  if (!match) return false;
+  const prefix = normalized.slice(0, match.index);
+  // Products preserved in oil/vinegar are not bottles of that ingredient.
+  return !/(?:\b(?:in|with)|(?:^|\s)(?:в|с))\s+(?:[\p{L}-]+\s+){0,3}$/u.test(prefix)
+    && !/домати|tomatoes|риба|тон|tuna|sardine|крастав|cucumber|чипс|chips|маслини|olives/u.test(prefix);
 }
 

@@ -1,7 +1,25 @@
 import { describe, expect, it } from 'vitest';
-import { assessOffer, rankAssessments, recalculateShoppingSubtotals } from './pricing.js';
+import { assessOffer, rankAssessments, recalculateShoppingSubtotals, recalculateShoppingComparison } from './pricing.js';
+import type { ShoppingComparison } from '@home-meal-planner/contracts';
 
 describe('deterministic product pricing', () => {
+  it('does not borrow a complete assessment from another line or inflate the incomplete count', () => {
+    const oil = { id: 'oil', storeId: 'vmv', title: 'Зехтин 750 ml', packageQuantity: 750, packageUnit: 'ml' as const, price: 12.58, currency: 'EUR', priceBasis: 'package' as const, availability: 'available' as const, provenance: 'demo' as const, productUrl: 'https://vmv.bg/products/oil' };
+    const comparison: ShoppingComparison = {
+      id: 'c', mealPlanId: 'p', createdAt: '', updatedAt: '', subtotals: [],
+      lines: [
+        { id: 'unspecified', semanticKey: 'oil', ingredient: { name: 'olive oil', modifiers: [] }, offers: [oil], included: true, selectedOfferId: oil.id },
+        { id: 'measured', semanticKey: 'oil', ingredient: { name: 'olive oil', modifiers: [] }, requiredQuantity: 510, requiredUnit: 'ml', offers: [oil], included: true, selectedOfferId: oil.id },
+      ],
+      assessments: [{ offerId: oil.id, lineId: 'measured', group: 'alternative', status: 'complete', purchaseCost: 12.58 }],
+    };
+    const priced = recalculateShoppingComparison(comparison);
+    expect(priced.assessments.find((a) => a.lineId === 'unspecified')?.status).toBe('incomplete');
+    expect(priced.subtotals[0]).toMatchObject({ status: 'incomplete', knownTotal: 12.58, incompleteLineCount: 1 });
+    expect(priced.subtotals[0].total).toBeUndefined();
+    comparison.lines[0].included = false;
+    expect(recalculateShoppingComparison(comparison).subtotals[0]).toMatchObject({ status: 'complete', total: 12.58, incompleteLineCount: 0 });
+  });
   it('prefers the exact brand group and calculates packages plus excess', () => {
     const ingredient = { name: 'домати', quantity: 200, unit: 'g' as const, brand: 'Brand A', form: 'fresh' as const, modifiers: [] };
     const exact = { id: 'a', storeId: 'x', title: 'Brand A tomatoes 250g', brand: 'Brand A', packageQuantity: 250, packageUnit: 'g' as const, price: 1.5, currency: 'EUR', priceBasis: 'package' as const, availability: 'available' as const, provenance: 'demo' as const, productUrl: 'https://example.com/a' };
@@ -49,6 +67,19 @@ describe('deterministic product pricing', () => {
 
     expect(assessment).toMatchObject({ packagesNeeded: 7, purchasedQuantity: 7000, excessQuantity: 600, purchaseCost: 87.15 });
     expect(subtotal).toMatchObject({ storeId: 'vmv', total: 87.15, status: 'complete', includedLineCount: 1, incompleteLineCount: 0 });
+  });
+
+  it('does not let a duplicate incomplete assessment hide the selected complete offer', () => {
+    const ingredient = { name: 'tomatoes', quantity: 6400, unit: 'g' as const, modifiers: [] };
+    const offer = { id: 'shared-tomato-offer', storeId: 'vmv', title: 'Tomatoes 1 kg', packageQuantity: 1, packageUnit: 'kg' as const, price: 2.4, currency: 'EUR', priceBasis: 'package' as const, availability: 'available' as const, provenance: 'live' as const, productUrl: 'https://vmv.bg/products/tomatoes' };
+    const completeAssessment = { ...assessOffer(ingredient, offer), lineId: 'tomatoes-line' };
+    const duplicateIncompleteAssessment = { ...assessOffer({ ...ingredient, quantity: undefined }, offer), lineId: 'another-line' };
+    const [subtotal] = recalculateShoppingSubtotals({
+      lines: [{ id: 'tomatoes-line', ingredient, requiredQuantity: 6400, requiredUnit: 'g', semanticKey: 'tomatoes', offers: [offer], selectedOfferId: offer.id, included: true }],
+      assessments: [duplicateIncompleteAssessment, completeAssessment],
+    });
+
+    expect(subtotal).toMatchObject({ storeId: 'vmv', total: 16.8, status: 'complete', includedLineCount: 1, incompleteLineCount: 0 });
   });
 
   it('keeps a store subtotal incomplete when any selected line is incomplete', () => {

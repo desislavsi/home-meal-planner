@@ -1,5 +1,5 @@
 import bcrypt from 'bcryptjs';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { FastifyInstance } from 'fastify';
 import type { ProductOffer, ShoppingComparison } from '@home-meal-planner/contracts';
 import { buildServer } from './server.js';
@@ -30,6 +30,7 @@ let app: FastifyInstance | undefined;
 afterEach(async () => {
   await app?.close();
   app = undefined;
+  vi.unstubAllGlobals();
 });
 
 async function login(app: FastifyInstance) {
@@ -190,7 +191,91 @@ describe('protected vertical slice', () => {
   });
 });
 
+describe('recipe deletion', () => {
+  it('deletes recipes and removes their entries from every meal plan', async () => {
+    const repository = new MemoryRepository();
+    app = await buildServer(testConfig, repository);
+    const cookie = await login(app);
+    const created = await app.inject({
+      method: 'POST', url: '/api/recipes', headers: { cookie },
+      payload: { title: 'Disposable recipe', servings: 2, ingredients: [], instructions: ['Mix'], tags: [], suitableMealSlots: [] },
+    });
+    expect(created.statusCode).toBe(200);
+    const unusedDeleted = await app.inject({ method: 'DELETE', url: `/api/recipes/${created.json().id}`, headers: { cookie } });
+    expect(unusedDeleted.statusCode).toBe(200);
+    expect(unusedDeleted.json()).toEqual({ deleted: true, removedPlannedMeals: 0 });
+    expect((await app.inject({ method: 'GET', url: '/api/recipes', headers: { cookie } })).json().some((recipe: { id: string }) => recipe.id === created.json().id)).toBe(false);
+    expect((await app.inject({ method: 'DELETE', url: `/api/recipes/${created.json().id}`, headers: { cookie } })).statusCode).toBe(404);
+
+    const plannedRecipe = (await app.inject({ method: 'GET', url: '/api/recipes', headers: { cookie } })).json()[0];
+    const today = new Date().toISOString().slice(0, 10);
+    const plan = await app.inject({
+      method: 'POST', url: '/api/meal-plans', headers: { cookie },
+      payload: { name: 'Clean up deleted recipe', startDate: today, endDate: today, entries: [
+        { id: 'breakfast-entry', date: today, slot: 'breakfast', recipeId: plannedRecipe.id, servings: 2 },
+        { id: 'lunch-entry', date: today, slot: 'lunch', recipeId: plannedRecipe.id, servings: 2 },
+      ] },
+    });
+    expect(plan.statusCode).toBe(200);
+    const deleted = await app.inject({ method: 'DELETE', url: `/api/recipes/${plannedRecipe.id}`, headers: { cookie } });
+    expect(deleted.statusCode).toBe(200);
+    expect(deleted.json()).toEqual({ deleted: true, removedPlannedMeals: 2 });
+    expect(await repository.getRecipe(plannedRecipe.id)).toBeUndefined();
+    expect((await repository.getMealPlan(plan.json().id))?.entries).toEqual([]);
+  });
+});
+
 describe('shopping subtotal synchronization', () => {
+  it('replays legacy oil/vinegar recipes through store parsing, selection, quantity edits and reload', async () => {
+    // Product names, quantities and prices from the reported VMV comparison.
+    const cards = [
+      ['oil', 'Зехтин Екстра Върджин Filippo Berio 0,750', '12,58'],
+      ['vinegar', 'Оцет винен червен 0,500', '2,00'],
+      ['tomatoes-in-oil', 'Сушени чери домати в слънчогледово олио 0.200', '3,52'],
+    ];
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(cards.map(([id, title, price]) => `<div data-slot="product-card"><a href="/products/${id}"><h3 data-testid="title">${title}</h3></a><span data-testid="product-price-regular-price">${price} €</span><span data-testid="price-container">/ бр. ${price} €</span></div>`).join(''))));
+    const repository = new MemoryRepository();
+    for (const store of await repository.listStores()) await repository.updateStore(store.id, { enabled: store.id === 'vmv' });
+    const recipe = await repository.createRecipe({ title: 'Legacy salad', servings: 2, ingredients: [
+      { name: '¼ cup extra-virgin olive oil', raw: '¼ cup extra-virgin olive oil', modifiers: [] },
+      { name: 'red wine vinegar', raw: '3 tablespoons red wine vinegar', quantity: 3, modifiers: [] },
+      { name: 'зехтин', quantity: 30, unit: 'ml', modifiers: [] },
+      { name: 'Extra-virgin olive oil', raw: 'Extra-virgin olive oil', modifiers: [] },
+    ], instructions: ['Mix'], tags: [], suitableMealSlots: [] });
+    const plan = await repository.createMealPlan({ name: 'Two weeks', startDate: '2026-10-03', endDate: '2026-10-16', entries: Array.from({ length: 14 }, (_, i) => ({ id: `e-${i}`, date: '2026-10-03', slot: 'lunch', recipeId: recipe.id, servings: 2 })) });
+    app = await buildServer({ ...testConfig, storeMode: 'live' }, repository);
+    const cookie = await login(app);
+    const response = await app.inject({ method: 'POST', url: `/api/meal-plans/${plan.id}/shopping/compare`, headers: { cookie } });
+    expect(response.statusCode).toBe(200);
+    let comparison = response.json<ShoppingComparison>();
+    const oil = comparison.lines.find((line) => line.ingredient.name === 'extra-virgin olive oil')!;
+    const vinegar = comparison.lines.find((line) => line.ingredient.name === 'red wine vinegar')!;
+    const unknown = comparison.lines.find((line) => line.requiredQuantity == null)!;
+    expect(oil).toMatchObject({ requiredQuantity: 840, requiredUnit: 'ml' });
+    expect(vinegar).toMatchObject({ requiredQuantity: 630, requiredUnit: 'ml' });
+    expect(oil.offers).toHaveLength(1);
+    expect(oil.offers[0]).toMatchObject({ packageQuantity: 750, packageUnit: 'ml' });
+    const patch = async (lineId: string, payload: object) => {
+      const result = await app!.inject({ method: 'PATCH', url: `/api/shopping-comparisons/${comparison.id}/lines/${lineId}`, headers: { cookie }, payload });
+      expect(result.statusCode).toBe(200);
+      comparison = result.json<ShoppingComparison>();
+      return comparison;
+    };
+    await patch(oil.id, { selectedOfferId: oil.offers[0].id });
+    await patch(vinegar.id, { selectedOfferId: vinegar.offers[0].id });
+    expect(comparison.subtotals[0]).toMatchObject({ status: 'complete', total: 29.16 });
+    await patch(unknown.id, { selectedOfferId: unknown.offers[0].id });
+    expect(comparison.subtotals[0]).toMatchObject({ status: 'incomplete', knownTotal: 29.16, incompleteLineCount: 1 });
+    await patch(unknown.id, { included: false });
+    expect(comparison.subtotals[0]).toMatchObject({ status: 'complete', total: 29.16 });
+    await patch(unknown.id, { included: true, requiredQuantity: 0.06, requiredUnit: 'l' });
+    expect(comparison.subtotals[0]).toMatchObject({ status: 'complete', total: 41.74 });
+    const invalid = await app.inject({ method: 'PATCH', url: `/api/shopping-comparisons/${comparison.id}/lines/${unknown.id}`, headers: { cookie }, payload: { requiredQuantity: -1 } });
+    expect(invalid.statusCode).toBe(400);
+    const reloaded = await app.inject({ method: 'GET', url: `/api/shopping-comparisons/${comparison.id}`, headers: { cookie } });
+    expect(reloaded.json().subtotals[0]).toMatchObject({ status: 'complete', total: 41.74 });
+    expect(reloaded.json().lines.find((line: { id: string }) => line.id === unknown.id)).toMatchObject({ requiredQuantity: 60, requiredUnit: 'ml' });
+  });
   it('repairs stale subtotals on read and updates them when offers change', async () => {
     const ingredient = { name: 'tomatoes', quantity: 6400, unit: 'g' as const, modifiers: [] };
     const completeOffer: ProductOffer = { id: 'tomato-pack', storeId: 'vmv', title: 'Tomatoes 1 kg', packageQuantity: 1, packageUnit: 'kg', price: 12.45, currency: 'EUR', priceBasis: 'package', availability: 'available', provenance: 'live', productUrl: 'https://vmv.bg/products/tomatoes' };
@@ -211,7 +296,7 @@ describe('shopping subtotal synchronization', () => {
 
     const repaired = await app.inject({ method: 'GET', url: '/api/shopping-comparisons/stale-comparison', headers: { cookie } });
     expect(repaired.statusCode).toBe(200);
-    expect(repaired.json().subtotals).toEqual([{ storeId: 'vmv', currency: 'EUR', total: 87.15, status: 'complete', includedLineCount: 1, incompleteLineCount: 0 }]);
+    expect(repaired.json().subtotals).toEqual([{ storeId: 'vmv', currency: 'EUR', total: 87.15, knownTotal: 87.15, status: 'complete', includedLineCount: 1, incompleteLineCount: 0 }]);
 
     const incomplete = await app.inject({
       method: 'PATCH',

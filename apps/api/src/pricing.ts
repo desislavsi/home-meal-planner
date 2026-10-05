@@ -1,5 +1,6 @@
 import type { Ingredient, OfferAssessment, ProductOffer, ShoppingComparison, ShoppingLine, StoreSubtotal } from '@home-meal-planner/contracts';
 import { baseQuantity } from './ingredients.js';
+import { productMatchesIngredient } from './ingredient-search.js';
 
 const roundCurrency = (value: number) => Math.round((value + Number.EPSILON) * 100) / 100;
 
@@ -16,7 +17,8 @@ export function assessOffer(ingredient: Ingredient, offer: ProductOffer): OfferA
     ? 'exact-brand'
     : 'alternative';
   if (offer.availability !== 'available') return { offerId: offer.id, group, status: 'incomplete', reason: offer.availability === 'unavailable' ? 'Product is unavailable.' : 'Availability is unknown.' };
-  if (ingredient.quantity == null || ingredient.unit == null) return { offerId: offer.id, group, status: 'incomplete', reason: 'Required quantity or unit is missing.' };
+  if (ingredient.quantity == null) return { offerId: offer.id, group, status: 'incomplete', reason: 'Recipe amount is unspecified. Add an amount and unit to the recipe, then refresh this comparison.' };
+  if (ingredient.unit == null) return { offerId: offer.id, group, status: 'incomplete', reason: 'Recipe unit is missing. Add a unit to the recipe, then refresh this comparison.' };
   if (offer.price == null || offer.priceBasis == null) return { offerId: offer.id, group, status: 'incomplete', reason: 'Price or price basis is unknown.' };
   if (!compatible(ingredient.unit, offer.priceBasis)) return { offerId: offer.id, group, status: 'incomplete', reason: 'Price basis is incompatible with the required unit.' };
 
@@ -70,8 +72,17 @@ export function rankAssessments(assessments: OfferAssessment[]): OfferAssessment
   });
 }
 
+function assessmentForLine(line: ShoppingLine, offerId: string, assessments: OfferAssessment[]) {
+  const lineMatches = assessments.filter((assessment) => assessment.lineId === line.id && assessment.offerId === offerId);
+  if (lineMatches.length) return lineMatches[0];
+
+  // Legacy/global offer IDs cannot identify a requirement. Recalculate from
+  // this line rather than borrowing a cheaper or complete result elsewhere.
+  const offer = line.offers.find((offer) => offer.id === offerId);
+  return offer ? assessOffer({ ...line.ingredient, quantity: line.requiredQuantity, unit: line.requiredUnit }, offer) : undefined;
+}
+
 export function calculateSubtotals(lines: ShoppingLine[], assessments: OfferAssessment[]): StoreSubtotal[] {
-  const byOffer = new Map(assessments.map((assessment) => [assessment.offerId, assessment]));
   const totals = new Map<string, StoreSubtotal>();
   for (const line of lines) {
     if (!line.included || !line.selectedOfferId) continue;
@@ -81,18 +92,20 @@ export function calculateSubtotals(lines: ShoppingLine[], assessments: OfferAsse
       storeId: offer.storeId,
       currency: offer.currency,
       total: 0,
+      knownTotal: 0,
       status: 'complete' as const,
       includedLineCount: 0,
       incompleteLineCount: 0,
     };
-    const assessment = byOffer.get(offer.id);
+    const assessment = assessmentForLine(line, offer.id, assessments);
     subtotal.includedLineCount += 1;
-    if (!assessment || assessment.status === 'incomplete' || subtotal.total == null) {
+    if (!assessment || assessment.status === 'incomplete' || assessment.purchaseCost == null || !Number.isFinite(assessment.purchaseCost)) {
       subtotal.status = 'incomplete';
       subtotal.total = undefined;
       subtotal.incompleteLineCount += 1;
-    } else if (subtotal.status === 'complete') {
-      subtotal.total = roundCurrency(subtotal.total + (assessment.purchaseCost ?? 0));
+    } else {
+      subtotal.knownTotal = roundCurrency((subtotal.knownTotal ?? 0) + assessment.purchaseCost);
+      if (subtotal.status === 'complete') subtotal.total = subtotal.knownTotal;
     }
     totals.set(offer.storeId, subtotal);
   }
@@ -101,4 +114,21 @@ export function calculateSubtotals(lines: ShoppingLine[], assessments: OfferAsse
 
 export function recalculateShoppingSubtotals(comparison: Pick<ShoppingComparison, 'lines' | 'assessments'>): StoreSubtotal[] {
   return calculateSubtotals(comparison.lines, comparison.assessments);
+}
+
+export function recalculateShoppingComparison(comparison: ShoppingComparison): ShoppingComparison {
+  const assessments = comparison.lines.flatMap((line) => {
+    const required = { ...line.ingredient, quantity: line.requiredQuantity, unit: line.requiredUnit };
+    const ranked = rankAssessments(line.offers.map((offer) => {
+      const assessment = assessOffer(required, offer);
+      return productMatchesIngredient(line.ingredient, offer)
+        ? { ...assessment, lineId: line.id }
+        : { offerId: offer.id, lineId: line.id, group: assessment.group, status: 'incomplete' as const, reason: 'This product does not match the ingredient. Choose another product or refresh stores.' };
+    }));
+    line.recommendedOfferId = ranked.find((assessment) => assessment.status === 'complete')?.offerId;
+    const order = new Map(ranked.map((assessment, index) => [assessment.offerId, index]));
+    line.offers.sort((a, b) => (order.get(a.id) ?? 0) - (order.get(b.id) ?? 0));
+    return ranked;
+  });
+  return { ...comparison, assessments, subtotals: calculateSubtotals(comparison.lines, assessments) };
 }

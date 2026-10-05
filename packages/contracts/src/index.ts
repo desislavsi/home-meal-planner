@@ -121,6 +121,10 @@ export const shoppingLineSchema = z.object({
 export type ShoppingLine = z.infer<typeof shoppingLineSchema>;
 
 export const offerAssessmentSchema = z.object({
+  // Offer IDs can be reused by a store adapter for the same product matched
+  // against more than one shopping line. Keep the line context so pricing
+  // never applies an assessment calculated for a different requirement.
+  lineId: z.string().optional(),
   offerId: z.string(),
   group: z.enum(['exact-brand', 'alternative']),
   status: z.enum(['complete', 'incomplete']),
@@ -137,6 +141,7 @@ export const storeSubtotalSchema = z.object({
   storeId: z.string(),
   currency: z.string().optional(),
   total: z.number().nonnegative().optional(),
+  knownTotal: z.number().nonnegative().optional(),
   status: z.enum(['complete', 'incomplete']),
   includedLineCount: z.number().int().nonnegative(),
   incompleteLineCount: z.number().int().nonnegative(),

@@ -20,7 +20,9 @@ export interface Repository {
   getRecipe(id: string): Promise<Recipe | undefined>
   createRecipe(input: RecipeInput): Promise<Recipe>
   updateRecipe(id: string, input: Partial<RecipeInput>): Promise<Recipe | undefined>
+  deleteRecipe(id: string): Promise<boolean>
   createMealPlan(input: MealPlanInput): Promise<MealPlan>
+  listMealPlans(): Promise<MealPlan[]>
   getMealPlan(id: string): Promise<MealPlan | undefined>
   updateMealPlan(id: string, input: Partial<MealPlanInput>): Promise<MealPlan | undefined>
   saveComparison(comparison: ShoppingComparison): Promise<ShoppingComparison>
@@ -104,12 +106,14 @@ export class MemoryRepository implements Repository {
     this.recipes.set(id, recipe);
     return recipe;
   }
+  async deleteRecipe(id: string) { return this.recipes.delete(id); }
   async createMealPlan(input: MealPlanInput) {
     const timestamp = now();
     const plan = mealPlanSchema.parse({ ...input, id: randomUUID(), createdAt: timestamp, updatedAt: timestamp });
     this.plans.set(plan.id, plan);
     return plan;
   }
+  async listMealPlans() { return [...this.plans.values()]; }
   async getMealPlan(id: string) { return this.plans.get(id); }
   async updateMealPlan(id: string, input: Partial<MealPlanInput>) {
     const current = this.plans.get(id);
@@ -155,7 +159,9 @@ export class FileRepository implements Repository {
   getRecipe(id: string) { return this.memory.getRecipe(id); }
   async createRecipe(input: RecipeInput) { const value = await this.memory.createRecipe(input); await this.persist(); return value; }
   async updateRecipe(id: string, input: Partial<RecipeInput>) { const value = await this.memory.updateRecipe(id, input); if (value) await this.persist(); return value; }
+  async deleteRecipe(id: string) { const deleted = await this.memory.deleteRecipe(id); if (deleted) await this.persist(); return deleted; }
   createMealPlan(input: MealPlanInput) { return this.createAndPersist(() => this.memory.createMealPlan(input)); }
+  listMealPlans() { return this.memory.listMealPlans(); }
   getMealPlan(id: string) { return this.memory.getMealPlan(id); }
   async updateMealPlan(id: string, input: Partial<MealPlanInput>) { const value = await this.memory.updateMealPlan(id, input); if (value) await this.persist(); return value; }
   async saveComparison(comparison: ShoppingComparison) { const value = await this.memory.saveComparison(comparison); await this.persist(); return value; }
@@ -188,12 +194,17 @@ export class MongoRepository implements Repository {
     await this.collection<Recipe>('recipes').replaceOne({ id }, recipe);
     return recipe;
   }
+  async deleteRecipe(id: string) {
+    const result = await this.collection<Recipe>('recipes').deleteOne({ id });
+    return result.deletedCount > 0;
+  }
   async createMealPlan(input: MealPlanInput) {
     const timestamp = now();
     const plan = mealPlanSchema.parse({ ...input, id: randomUUID(), createdAt: timestamp, updatedAt: timestamp });
     await this.collection<MealPlan>('mealPlans').insertOne(plan);
     return plan;
   }
+  async listMealPlans() { return (await this.collection<MealPlan>('mealPlans').find({}).toArray()).map((item) => mealPlanSchema.parse(item)); }
   async getMealPlan(id: string) { const item = await this.collection<MealPlan>('mealPlans').findOne({ id }); return item ? mealPlanSchema.parse(item) : undefined; }
   async updateMealPlan(id: string, input: Partial<MealPlanInput>) {
     const current = await this.getMealPlan(id);

@@ -5,6 +5,7 @@ import cookie from '@fastify/cookie';
 import cors from '@fastify/cors';
 import {
   ingredientSchema,
+  ingredientUnitSchema,
   mealPlanInputSchema,
   mealPlanSchema,
   mealSuggestionsSchema,
@@ -18,9 +19,9 @@ import {
 } from '@home-meal-planner/contracts';
 import type { AppConfig } from './config.js';
 import { importRecipeFromUrl } from './recipe-import.js';
-import { consolidateIngredients } from './ingredients.js';
+import { baseQuantity, consolidateIngredients } from './ingredients.js';
 import { applyPriceBasisDefaults, buildIngredientSearchProfile, productMatchesIngredient } from './ingredient-search.js';
-import { assessOffer, rankAssessments, recalculateShoppingSubtotals } from './pricing.js';
+import { recalculateShoppingComparison } from './pricing.js';
 import { suggestMeals } from './ai.js';
 import type { Repository } from './repository.js';
 import { createStoreAdapters } from './stores.js';
@@ -104,6 +105,19 @@ export async function buildServer(config: AppConfig, repository: Repository): Pr
   app.patch('/api/recipes/:id', async (request, reply) => {
     try { const recipe = await repository.updateRecipe((request.params as { id: string }).id, recipeInputSchema.partial().parse(request.body)); return recipe ?? reply.code(404).send({ error: 'Recipe not found.' }); } catch (error) { return reply.code(400).send({ error: errorMessage(error) }); }
   });
+  app.delete('/api/recipes/:id', async (request, reply) => {
+    const id = (request.params as { id: string }).id;
+    if (!await repository.getRecipe(id)) return reply.code(404).send({ error: 'Recipe not found.' });
+    let removedPlannedMeals = 0;
+    for (const plan of await repository.listMealPlans()) {
+      const entries = plan.entries.filter((entry) => entry.recipeId !== id);
+      removedPlannedMeals += plan.entries.length - entries.length;
+      if (entries.length !== plan.entries.length) await repository.updateMealPlan(plan.id, { entries });
+    }
+    const deleted = await repository.deleteRecipe(id);
+    if (!deleted) return reply.code(404).send({ error: 'Recipe not found.' });
+    return reply.send({ deleted: true, removedPlannedMeals });
+  });
   app.post('/api/recipes/import', async (request, reply) => {
     try { const body = request.body as { url?: string }; if (!body.url) return reply.code(400).send({ error: 'A recipe URL is required.' }); return await importRecipeFromUrl(body.url, false); } catch (error) { return reply.code(400).send({ error: errorMessage(error) }); }
   });
@@ -172,7 +186,7 @@ export async function buildServer(config: AppConfig, repository: Repository): Pr
     const adapterMap = new Map(adapters.map((adapter) => [adapter.id, adapter]));
     const liveResults = await Promise.all(stores.map(async (store) => {
       const adapter = adapterMap.get(store.id);
-      if (!adapter) return { store, products: [] as ProductOffer[] };
+      if (!adapter) return { store, productsByLine: new Map<string, ProductOffer[]>() };
       const products = await Promise.all(lines.map(async (line) => {
         const profile = buildIngredientSearchProfile(line.ingredient);
         const results = await Promise.all(profile.searchTerms.map(async (query) => {
@@ -185,34 +199,37 @@ export async function buildServer(config: AppConfig, repository: Repository): Pr
         }
         return [...uniqueOffers.values()];
       }));
-      return { store, products: products.flat() };
+      return { store, productsByLine: new Map(lines.map((line, index) => [line.id, products[index]])) };
     }));
-    const assessments = [];
     for (const line of lines) {
-      const offers = liveResults.flatMap((result) => result.products.filter((product) => productMatchesIngredient(line.ingredient, product)));
-      line.offers = offers;
-      // Assess against the consolidated line quantity, not only the first
-      // recipe occurrence represented by line.ingredient.
-      const requiredIngredient: Ingredient = {
-        ...line.ingredient,
-        quantity: line.requiredQuantity,
-        unit: line.requiredUnit,
-      };
-      const ranked = rankAssessments(offers.map((offer) => assessOffer(requiredIngredient, offer)));
-      assessments.push(...ranked);
-      line.recommendedOfferId = ranked.find((assessment) => assessment.status === 'complete')?.offerId;
+      line.offers = liveResults.flatMap((result) => result.productsByLine?.get(line.id) ?? []);
     }
     const timestamp = new Date().toISOString();
-    const comparison: ShoppingComparison = shoppingComparisonSchema.parse({ id: randomUUID(), mealPlanId: plan.id, lines, assessments, subtotals: recalculateShoppingSubtotals({ lines, assessments }), createdAt: timestamp, updatedAt: timestamp });
+    const comparison = recalculateShoppingComparison(shoppingComparisonSchema.parse({ id: randomUUID(), mealPlanId: plan.id, lines, assessments: [], subtotals: [], createdAt: timestamp, updatedAt: timestamp }));
     return repository.saveComparison(comparison);
   });
   app.patch('/api/shopping-comparisons/:id/lines/:lineId', async (request, reply) => {
-    const comparison = await repository.getComparison((request.params as { id: string }).id);
-    if (!comparison) return reply.code(404).send({ error: 'Shopping comparison not found.' });
+    const stored = await repository.getComparison((request.params as { id: string }).id);
+    if (!stored) return reply.code(404).send({ error: 'Shopping comparison not found.' });
+    const comparison = structuredClone(stored);
     const lineId = (request.params as { lineId: string }).lineId;
     const line = comparison.lines.find((item) => item.id === lineId);
     if (!line) return reply.code(404).send({ error: 'Shopping line not found.' });
-    const body = request.body as { included?: boolean; selectedOfferId?: string | null };
+    const body = request.body as { included?: boolean; selectedOfferId?: string | null; requiredQuantity?: number; requiredUnit?: Ingredient['unit'] };
+    if (body.requiredQuantity !== undefined) {
+      if (typeof body.requiredQuantity !== 'number' || !Number.isFinite(body.requiredQuantity) || body.requiredQuantity <= 0) return reply.code(400).send({ error: 'Shopping quantity must be a positive number.' });
+      line.requiredQuantity = body.requiredQuantity;
+    }
+    if (body.requiredUnit !== undefined) {
+      const unit = ingredientUnitSchema.safeParse(body.requiredUnit);
+      if (!unit.success || unit.data === 'unknown') return reply.code(400).send({ error: 'Choose a supported shopping unit.' });
+      line.requiredUnit = unit.data;
+    }
+    if ((body.requiredQuantity !== undefined || body.requiredUnit !== undefined) && line.requiredQuantity != null) {
+      const normalized = baseQuantity(line.requiredQuantity, line.requiredUnit);
+      line.requiredQuantity = normalized.value;
+      line.requiredUnit = normalized.unit ?? line.requiredUnit;
+    }
     if (body.included != null) line.included = body.included;
     if (body.selectedOfferId !== undefined) {
       if (body.selectedOfferId !== null && !line.offers.some((offer) => offer.id === body.selectedOfferId)) return reply.code(400).send({ error: 'Selected offer does not belong to this line.' });
@@ -220,15 +237,14 @@ export async function buildServer(config: AppConfig, repository: Repository): Pr
       if (selectedOffer && !validateStoreProductUrl(config, selectedOffer.storeId, selectedOffer.productUrl)) return reply.code(400).send({ error: 'Selected offer URL does not belong to its configured store.' });
       line.selectedOfferId = body.selectedOfferId ?? undefined;
     }
-    comparison.subtotals = recalculateShoppingSubtotals(comparison);
     comparison.updatedAt = new Date().toISOString();
-    return repository.updateComparison(comparison.id, comparison);
+    return repository.updateComparison(comparison.id, recalculateShoppingComparison(comparison));
   });
 
   app.get('/api/shopping-comparisons/:id', async (request, reply) => {
     const comparison = await repository.getComparison((request.params as { id: string }).id);
     if (!comparison) return reply.code(404).send({ error: 'Shopping comparison not found.' });
-    const refreshed = shoppingComparisonSchema.parse({ ...comparison, subtotals: recalculateShoppingSubtotals(comparison) });
+    const refreshed = shoppingComparisonSchema.parse(recalculateShoppingComparison(structuredClone(comparison)));
     await repository.updateComparison(refreshed.id, refreshed);
     return refreshed;
   });

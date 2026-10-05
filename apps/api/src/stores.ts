@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import * as cheerio from 'cheerio';
 import type { ProductOffer, StoreSetting } from '@home-meal-planner/contracts';
 import type { AppConfig } from './config.js';
+import { isStandaloneLiquidProduct } from './ingredient-search.js';
 
 export type StoreSearchInput = { query: string; location: string };
 
@@ -76,7 +77,7 @@ function availabilityFromActiveListing(text: string): ProductOffer['availability
   return unavailableListingPattern.test(text) ? 'unavailable' : 'available';
 }
 
-type InferredOfferDetails = Pick<ProductOffer, 'packageQuantity' | 'packageUnit' | 'priceBasis'>;
+type InferredOfferDetails = Pick<ProductOffer, 'packageQuantity' | 'packageUnit' | 'priceBasis' | 'priceBasisAssumed'>;
 
 function inferOfferDetails(title: string, context: string): InferredOfferDetails {
   const text = `${title} ${context}`.toLocaleLowerCase();
@@ -96,10 +97,12 @@ function inferOfferDetails(title: string, context: string): InferredOfferDetails
     return { packageQuantity: amount, packageUnit: 'pcs', priceBasis: 'package' };
   }
 
-  // VMV uses a compact decimal form such as 0,400 for a 400 g pack.
+  // VMV omits the unit in compact titles: 0,400 for food weight, but
+  // 0,750 for an oil bottle means litres. Explicit units above always win.
   const compactWeight = title.match(/(?:^|\s)(0[,.]\d{3})(?:\s|$)/);
   if (compactWeight && /(?:\/|на|per)\s*(?:бр\.?|pcs?|item)(?=$|[^\p{L}])/iu.test(text)) {
-    return { packageQuantity: Number(compactWeight[1].replace(',', '.')) * 1000, packageUnit: 'g', priceBasis: 'package' };
+    const liquid = isStandaloneLiquidProduct(title, 'oil') || isStandaloneLiquidProduct(title, 'vinegar');
+    return { packageQuantity: Number(compactWeight[1].replace(',', '.')) * 1000, packageUnit: liquid ? 'ml' : 'g', priceBasis: 'package', priceBasisAssumed: liquid || undefined };
   }
   if (/(?:\/|на|per)\s*(?:бр\.?|pcs?|item)(?=$|[^\p{L}])/iu.test(text)) return { priceBasis: 'package' };
   return {};

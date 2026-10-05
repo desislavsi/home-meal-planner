@@ -9,6 +9,20 @@ afterEach(() => {
 });
 
 describe('live adapter parsing', () => {
+  it('parses compact oil and vinegar bottle sizes as volume, and tomatoes as weight', async () => {
+    globalThis.fetch = vi.fn(async () => new Response([
+      ['oil', 'Зехтин Екстра Върджин Filippo Berio 0,750', '12,58'],
+      ['vinegar', 'Оцет винен червен 0,500', '2,00'],
+      ['tomatoes', 'Сушени чери домати в слънчогледово олио 0.200', '3,52'],
+      ['explicit', 'Зехтин 500 г', '5,00'],
+    ].map(([id, title, price]) => `<div data-slot="product-card"><a href="/products/${id}"><h3 data-testid="title">${title}</h3></a><span data-testid="product-price-regular-price">${price} €</span><span data-testid="price-container">/ бр. ${price} €</span></div>`).join('')));
+    const adapter = new HtmlStoreAdapter('vmv', 'VMV', 'https://vmv.bg/search?q={query}');
+    const products = await adapter.searchProducts({ query: 'oil', location: 'Sofia' });
+    expect(products[0]).toMatchObject({ packageQuantity: 750, packageUnit: 'ml', price: 12.58, priceBasis: 'package' });
+    expect(products[1]).toMatchObject({ packageQuantity: 500, packageUnit: 'ml' });
+    expect(products[2]).toMatchObject({ packageQuantity: 200, packageUnit: 'g' });
+    expect(products[3]).toMatchObject({ packageQuantity: 500, packageUnit: 'g' });
+  });
   it('parses a recorded Randi-style product card', async () => {
     globalThis.fetch = vi.fn(async () => new Response(`
       <div class="product-layout"><div class="product-thumb">
