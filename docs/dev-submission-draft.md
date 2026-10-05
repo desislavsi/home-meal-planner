@@ -44,6 +44,8 @@ React + Vite -> Fastify -> Ollama -> Gemma 4 E4B
 
 Gemma is used for meal suggestions and recipe-aware interpretation. Mastra provides the agent layer around the local model. Deterministic application code remains responsible for recipe-ID validation, date and meal-slot validation, ingredient consolidation, unit compatibility, package calculations, ranking, and shopping totals.
 
+The successful live run with Ollama and `gemma4:e4b`, including the terminal output and validated response, is documented in the [Gemma smoke-test evidence](https://github.com/desislavsi/home-meal-planner/blob/main/reports/gemma-smoke.md).
+
 The app supports two modes:
 
 - Live mode checks public product pages from VMV and Randi. Their current smoke-test evidence is stored in [`reports/live-store-smoke.json`](https://github.com/desislavsi/home-meal-planner/blob/main/reports/live-store-smoke.json).
